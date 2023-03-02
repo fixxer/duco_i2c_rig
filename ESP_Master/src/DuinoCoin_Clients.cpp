@@ -1,0 +1,705 @@
+/*
+  DuinoCoin_Clients.ino
+  created 10 05 2021
+  by Luiz H. Cassettari
+
+  Modified by JK Rolling
+*/
+#include <Arduino.h>
+
+#if ESP8266
+#include <ESP8266WiFi.h> // Include WiFi library
+#include <ESP8266mDNS.h> // OTA libraries
+#include <WiFiUdp.h>
+#endif
+#if ESP32
+#include <WiFi.h>
+#include <WiFiClient.h>
+#endif
+
+#include <StreamString.h>
+
+#include "DuinoCoin_AsyncWebServer.h"
+#include "DuinoCoin_Clients.h"
+#include "DuinoCoin_Esp_Async_Master.h"
+#include "DuinoCoin_Pool.h"
+#include "DuinoCoin_Wire.h"
+
+#define CLIENTS 10
+
+#define CLIENT_CONNECT_EVERY 30000
+#define CLIENT_TIMEOUT_CONNECTION 30000
+#define CLIENT_TIMEOUT_REQUEST 100
+
+#define END_TOKEN '\n'
+#define SEP_TOKEN ','
+#define BAD "Rejected"
+#define GOOD "Accepted"
+#define BLOCK "Block"
+
+#define HASHRATE_FORCE false
+#define HASHRATE_SPEED 258.0
+
+extern const char *ducouser;
+extern const char *rigIdentifier;
+
+String host = "162.55.103.174";
+int port = 6000;
+String final_mining_key = "None";
+
+static float calc_avg_hashrate();
+static void clients_query(byte i);
+static void clients_waitAns(byte i);
+static String clients_readData(byte i);
+static uint8_t calc_crc8(String msg);
+static String getValue(String data, char separator, int index);
+static boolean query_runEvery(unsigned long interval);
+static void clients_sendJobDone(byte i);
+static void clients_waitRequestJob(byte i);
+static void clients_requestJob(byte i);
+static void clients_waitRequestVersion(byte i);
+static boolean clients_runEvery(unsigned long interval);
+static void clients_state(byte i, byte state);
+
+void SetHostPort(String h, int p) {
+  host = h;
+  port = p;
+}
+
+String getHostPort() { return host + String(":") + String(port); }
+
+String SetHost(String h) {
+  host = h;
+  return host;
+}
+
+int SetPort(int p) {
+  port = p;
+  return port;
+}
+
+void SetMiningKey(String key) { final_mining_key = key; }
+
+// State Machine
+enum Duino_State {
+  DUINO_STATE_NONE,
+
+  DUINO_STATE_VERSION_WAIT,
+
+  DUINO_STATE_MOTD_REQUEST,
+  DUINO_STATE_MOTD_WAIT,
+
+  DUINO_STATE_JOB_REQUEST,
+  DUINO_STATE_JOB_WAIT,
+
+  DUINO_STATE_JOB_DONE_SEND,
+  DUINO_STATE_JOB_DONE_WAIT,
+};
+
+WiFiClient clients[CLIENTS];
+byte clientsWaitJob[CLIENTS];
+int clientsShares[CLIENTS];
+String clientsBuffer[CLIENTS];
+unsigned long clientsTimes[CLIENTS];
+unsigned long clientsTimeOut[CLIENTS];
+unsigned long clientsPingTime[CLIENTS];
+unsigned long clientsGetTime[CLIENTS];
+unsigned long clientsElapsedTime[CLIENTS];
+float clientsHashRate[CLIENTS];
+unsigned int clientsDiff[CLIENTS];
+byte clientsBadJob[CLIENTS];
+byte clientsForceReconnect[CLIENTS];
+bool clientsCRC8Status[CLIENTS];
+String poolMOTD;
+unsigned int share_count = 0;
+unsigned int accepted_count = 0;
+unsigned int block_count = 0;
+unsigned int last_share_count = 0;
+unsigned long startTime = millis();
+
+unsigned long clientsConnectTime = 0;
+bool clientsMOTD = true;
+bool clientsQuery = true;
+byte firstClientAddr = 0;
+
+bool clients_connected(byte i) { return clients[i].connected(); }
+
+bool clients_connect(byte i) {
+  if (clients[i].connected()) {
+    return true;
+  }
+
+  wire_readLine(i);
+
+  clients_query(i);
+  clients_waitAns(i);
+
+  Serial.print("[" + String(i) + "]");
+  Serial.println("Connecting to Duino-Coin server... " + String(host) + " " +
+                 String(port));
+
+  ws_sendAll("[" + String(i) + "]" + "Connecting to Duino-Coin server... " +
+             String(host) + " " + String(port));
+
+  clients[i].setTimeout(30000);
+  clients[i].flush();
+  if (!clients[i].connect(host.c_str(), port)) {
+    Serial.print("[" + String(i) + "]");
+    Serial.println("Connection failed..");
+    UpdatePool();
+    return false;
+  }
+  clients[i].setTimeout(1);
+
+  clientsShares[i] = 0;
+  clientsBadJob[i] = 0;
+  clientsTimes[i] = millis();
+  clientsBuffer[i] = "";
+  clients_state(i, DUINO_STATE_VERSION_WAIT);
+  clientsForceReconnect[i] = false;
+  share_count = 0;
+  accepted_count = 0;
+  block_count = 0;
+  last_share_count = 0;
+  return true;
+}
+
+static void clients_state(byte i, byte state) {
+  clientsWaitJob[i] = state;
+  clientsTimeOut[i] = millis();
+}
+
+bool clients_stop(byte i) {
+  clients_state(i, DUINO_STATE_NONE);
+  clients[i].stop();
+  return true;
+}
+
+void force_clients_reconnect() {
+  for (byte j = 0; j < CLIENTS; j++) {
+    clientsForceReconnect[j] = true;
+  }
+  clientsMOTD = true;
+}
+
+int client_i = 0;
+
+void clients_loop() {
+  if (clients_runEvery(clientsConnectTime)) {
+    clientsConnectTime = CLIENT_CONNECT_EVERY;
+    for (client_i = 0; client_i < CLIENTS; client_i++) {
+      int i = client_i;
+      if (wire_exists(i + 1) && !clients_connect(i)) {
+        break;
+      }
+    }
+  }
+
+  for (client_i = 0; client_i < CLIENTS; client_i++) {
+    int i = client_i;
+    if (wire_exists(i + 1) && clients_connected(i)) {
+      for (int j = 0; j < 3; j++)
+        switch (clientsWaitJob[i]) {
+        case DUINO_STATE_VERSION_WAIT:
+          clients_waitRequestVersion(i);
+          break;
+        case DUINO_STATE_JOB_REQUEST:
+          clients_requestJob(i);
+          break;
+        case DUINO_STATE_JOB_WAIT:
+          clients_waitRequestJob(i);
+          break;
+        case DUINO_STATE_JOB_DONE_SEND:
+          clients_sendJobDone(i);
+          break;
+        case DUINO_STATE_JOB_DONE_WAIT:
+          clients_waitFeedbackJobDone(i);
+          break;
+        case DUINO_STATE_MOTD_REQUEST:
+          clients_requestMOTD(i);
+          break;
+        case DUINO_STATE_MOTD_WAIT:
+          clients_waitMOTD(i);
+          break;
+        }
+
+      if (millis() - clientsTimeOut[i] > CLIENT_TIMEOUT_CONNECTION) {
+        Serial.println("[" + String(i) + "]" +
+                       " --------------- TIMEOUT ------------- ");
+        ws_sendAll("[" + String(i) + "]" +
+                   " --------------- TIMEOUT ------------- ");
+        clients_stop(i);
+      }
+    }
+  }
+}
+
+static void clients_query(byte i) {
+  Serial.print("[" + String(i) + "] ");
+  Serial.println("Worker: Query CRC8 status");
+  if (clientsQuery) {
+    firstClientAddr = i;
+    Wire_sendCmd(i + 1, "get,crc8");
+  }
+}
+
+static void clients_waitAns(byte i) {
+  if (clientsQuery) {
+    query_runEvery(0);
+    bool done = false;
+    while (!done) {
+      String responseJob = wire_readLine(i + 1);
+      if (responseJob.length() > 0) {
+        StreamString response;
+        response.print(responseJob);
+        clientsCRC8Status[i] = response.readStringUntil('\n').toInt();
+        Serial.print("[" + String(i) + "] ");
+        Serial.println("CRC8 update status: " + String(clientsCRC8Status[i]));
+        clientsQuery =
+            false; // set this to true if each client have different crc8 config
+        done = true;
+        break;
+      }
+      if (query_runEvery(100)) {
+        // probably legacy client, default to crc8 disable
+        clientsCRC8Status[i] = false;
+        Serial.print("[" + String(i) + "] ");
+        Serial.println("CRC8 fallback status: " + String(clientsCRC8Status[i]));
+        Wire_sendln(i + 1, ",1000");
+        delay(10);
+        wire_readLine(i + 1);
+        clientsQuery = false;
+        done = true;
+      }
+    }
+  } else {
+    // common use case where all slave have same crc8 settings
+    clientsCRC8Status[i] = clientsCRC8Status[firstClientAddr];
+    Serial.print("[" + String(i) + "] ");
+    Serial.println("CRC8 status: " + String(clientsCRC8Status[i]));
+  }
+}
+
+void clients_waitMOTD(byte i) {
+  if (clients[i].available()) {
+    String buffer = clients[i].readString();
+    poolMOTD = buffer;
+    Serial.println("[" + String(i) + "]" + buffer);
+    ws_sendAll("[" + String(i) + "]" + buffer);
+    clientsWaitJob[i] = DUINO_STATE_JOB_REQUEST;
+    clientsTimeOut[i] = millis();
+  }
+}
+
+void clients_requestMOTD(byte i) {
+  Serial.print("[" + String(i) + "]");
+  Serial.println("MOTD Request: " + String(ducouser));
+  ws_sendAll("MOTD Request: " + String(ducouser));
+  clients[i].print("MOTD");
+  clientsWaitJob[i] = DUINO_STATE_MOTD_WAIT;
+  clientsTimeOut[i] = millis();
+}
+
+String printMOTD() { return poolMOTD; }
+
+static void clients_waitRequestVersion(byte i) {
+  if (clients[i].available()) {
+    String buffer = clients[i].readStringUntil(END_TOKEN);
+    Serial.println("[" + String(i) + "]" + buffer);
+    clients_state(i, DUINO_STATE_JOB_REQUEST);
+    if (clientsMOTD)
+      clients_state(i, DUINO_STATE_MOTD_REQUEST);
+    clientsMOTD = false;
+  }
+}
+
+static void clients_requestJob(byte i) {
+  Serial.print("[" + String(i) + "] ");
+  Serial.println("Job Request: " + String(ducouser));
+  //  Serial.print("Job Request: ");
+  //  Serial.println("JOB," + String(ducouser) + "," + JOB + "," +
+  //  String(final_mining_key));
+  clients[i].print("JOB," + String(ducouser) + "," + JOB + "," +
+                   String(final_mining_key));
+  clientsGetTime[i] = millis();
+  clients_state(i, DUINO_STATE_JOB_WAIT);
+}
+
+static void clients_waitRequestJob(byte i) {
+  String clientBuffer = clients_readData(i);
+  if (clientBuffer.length() > 0) {
+    unsigned long getJobTime = millis() - clientsGetTime[i];
+    Serial.print("[" + String(i) + "] ");
+    Serial.print("Job ");
+    Serial.print(clientBuffer);
+    // ws_sendAll("[" + String(i) + "] Job "+ clientBuffer + "  ping " +
+    // String(getJobTime) + " ms");
+
+    // Not a Valid Job -> Request Again
+    if (clientBuffer.indexOf(',') == -1) {
+      clients_stop(i);
+      return;
+    }
+
+    String hash = getValue(clientBuffer, SEP_TOKEN, 0);
+    String job = getValue(clientBuffer, SEP_TOKEN, 1);
+    unsigned int diff = getValue(clientBuffer, SEP_TOKEN, 2).toInt();
+    clientsDiff[i] = diff;
+
+    clientsElapsedTime[i] = millis();
+    if (clientsCRC8Status[i]) {
+      String data =
+          hash + SEP_TOKEN + job + SEP_TOKEN + String(diff) + SEP_TOKEN;
+      uint8_t crc8 = calc_crc8(data);
+      data += String(crc8);
+      Serial.print("," + String(crc8));
+      Wire_sendln(i + 1, data);
+    } else {
+      wire_sendJob(i + 1, hash, job, diff);
+    }
+    Serial.println("  ping " + String(getJobTime) + " ms");
+    clients_state(i, DUINO_STATE_JOB_DONE_SEND);
+  }
+}
+
+static void clients_sendJobDone(byte i) {
+  String responseJob = wire_readLine(i + 1);
+  if (responseJob.length() > 0) {
+    clientsElapsedTime[i] = (millis() - clientsElapsedTime[i]);
+    // ws_sendAll("[" + String(i) + "]" + responseJob);
+
+    StreamString response;
+    response.print(responseJob);
+
+    int job = response.readStringUntil(',').toInt();
+    int time = response.readStringUntil(',').toInt();
+    String id;
+    if (clientsCRC8Status[i]) {
+      id = response.readStringUntil(',');
+      uint8_t received_crc8 = response.readStringUntil('\n').toInt();
+      String data =
+          String(job) + SEP_TOKEN + String(time) + SEP_TOKEN + id + SEP_TOKEN;
+      uint8_t expected_crc8 = calc_crc8(data);
+
+      if (received_crc8 != expected_crc8) {
+        // client reply corrupted
+        // should resend job to client
+        // don't care for now
+      }
+    } else {
+      id = response.readStringUntil('\n');
+    }
+    float HashRate = job / (time * .000001f);
+    clientsHashRate[i] = HashRate;
+
+    if (HASHRATE_FORCE) // Force HashRate to slow down
+    {
+      Serial.print("[" + String(i) + "]");
+      Serial.println("Slow down HashRate: " + String(HashRate, 2));
+      HashRate = HASHRATE_SPEED + random(-50, 50) / 100.0;
+    }
+
+    if (id.length() > 0)
+      id = "," + id;
+
+    String identifier = String(rigIdentifier) + "-" + String(i);
+
+    clients[i].print(String(job) + "," + String(HashRate, 2) + "," + MINER +
+                     "," + String(identifier) + id);
+
+    Serial.print("[" + String(i) + "] ");
+    Serial.println(String(job) + "," + String(HashRate, 2) + "," + MINER + "," +
+                   String(identifier) + id);
+    // Serial.println("Job Done: (" + String(job) + ")" + " Hashrate: " +
+    // String(HashRate));
+    clientsPingTime[i] = millis();
+    clients_state(i, DUINO_STATE_JOB_DONE_WAIT);
+  }
+}
+
+void clients_waitFeedbackJobDone(byte i) {
+  String clientBuffer = clients_readData(i);
+  if (clientBuffer.length() > 0) {
+    unsigned long time = (millis() - clientsTimes[i]);
+    unsigned long pingTime = (millis() - clientsPingTime[i]);
+    clientsShares[i]++;
+    int Shares = clientsShares[i];
+
+    String verdict = "";
+    share_count++;
+    if (clientBuffer == "GOOD") {
+      accepted_count++;
+      verdict = GOOD;
+    } else if (clientBuffer == "BLOCK") {
+      block_count++;
+      verdict = BLOCK;
+    } else {
+      verdict = BAD;
+    }
+
+    Serial.println("[" + String(i) + "] " + verdict + "  ⛏ " +
+                   String(accepted_count) + "/" + String(share_count) + " (" +
+                   String((float)accepted_count / (float)share_count * 100, 2) +
+                   "%)  " + String(clientsElapsedTime[i] / 1000.0, 2) + "s  " +
+                   String(clientsHashRate[i], 2) + " H/s  ⚙ " + "diff " +
+                   String(clientsDiff[i]) + "  ping " + String(pingTime) +
+                   "ms");
+    ws_sendAll("[" + String(i) + "] " + verdict + "  ⛏ " +
+               String(accepted_count) + "/" + String(share_count) + " (" +
+               String((float)accepted_count / (float)share_count * 100, 2) +
+               "%)  " + String(clientsElapsedTime[i] / 1000.0, 2) + "s  " +
+               String(clientsHashRate[i], 2) + " H/s  ⚙ " + "diff " +
+               String(clientsDiff[i]) + "  ping " + String(pingTime) + "ms");
+
+    clients_state(i, DUINO_STATE_JOB_REQUEST);
+
+    if (clientBuffer == "BAD") {
+      if (clientsBadJob[i]++ > 9) {
+        Serial.print("[" + String(i) + "]");
+        Serial.println("BAD BAD BAD BAD");
+        ws_sendAll("[" + String(i) + "]" + "BAD BAD BAD BAD");
+        clients_stop(i);
+      }
+    } else {
+      clientsBadJob[i] = 0;
+    }
+
+    if (clientsForceReconnect[i]) {
+      Serial.print("[" + String(i) + "]");
+      Serial.println("Forced disconnect");
+      ws_sendAll("[" + String(i) + "]" + "Forced disconnect");
+      clients_stop(i);
+    }
+  }
+}
+
+String clients_string() {
+  int i = 0;
+  String str = "I2C [ ";
+  for (i = 0; i < CLIENTS; i++) {
+    if (wire_exists(i + 1)) {
+      str += (i);
+      str += clients_connected(i) ? "." : "";
+      str += " ";
+    }
+  }
+  str += "]";
+  return str;
+}
+
+String clients_show2() {
+  int i = 0;
+  String str;
+  for (i = 0; i < CLIENTS; i++) {
+    str += String(i);
+    str += " ";
+  }
+  str += "\n";
+  for (i = 0; i < CLIENTS; i++) {
+    str += clients[i].connected();
+    str += " ";
+  }
+  str += "\n";
+
+  for (i = 0; i < CLIENTS; i++) {
+    str += wire_exists(i + 1);
+    str += " ";
+  }
+  str += "\n";
+  return str;
+}
+
+String clients_show() {
+  int i = 0;
+  String str;
+  str += client_i;
+  str += "\n";
+  for (i = 0; i < CLIENTS; i++) {
+    str += "[" + String(i) + "]";
+    str += " ";
+    str += clients[i].connected();
+    str += " ";
+
+    if (wire_exists(i + 1)) {
+      str += "Connected ";
+    } else {
+      str += "Not ";
+    }
+    str += clientsWaitJob[i];
+    str += " ";
+    str += "B";
+    str += clientsBadJob[i];
+
+    str += "\n";
+  }
+  ws_sendAll(str);
+  return str;
+}
+
+String timeString(unsigned long t) {
+  String str = "";
+  t /= 1000;
+  int s = t % 60;
+  int m = (t / 60) % 60;
+  int h = (t / 3600);
+  str += h;
+  str += ":";
+  if (m < 10)
+    str += "0";
+  str += m;
+  str += ":";
+  if (s < 10)
+    str += "0";
+  str += s;
+  return str;
+}
+
+static String clients_readData(byte i) {
+  String str = "";
+
+  while (clients[i].available()) {
+    char c = clients[i].read();
+    if (c == END_TOKEN) {
+      str = clientsBuffer[i];
+      clientsBuffer[i] = "";
+    } else
+      clientsBuffer[i] += c;
+  }
+
+  if (clientsBuffer[i] != "") {
+    if (millis() - clientsTimeOut[i] > CLIENT_TIMEOUT_REQUEST) {
+      str = clientsBuffer[i];
+      clientsBuffer[i] = "";
+    }
+  }
+
+  return str;
+}
+
+// https://stackoverflow.com/questions/9072320/split-string-into-string-array
+static String getValue(String data, char separator, int index) {
+  int found = 0;
+  int strIndex[] = {0, -1};
+  int maxIndex = data.length() - 1;
+
+  for (int i = 0; i <= maxIndex && found <= index; i++) {
+    if (data.charAt(i) == separator || i == maxIndex) {
+      found++;
+      strIndex[0] = strIndex[1] + 1;
+      strIndex[1] = (i == maxIndex) ? i + 1 : i;
+    }
+  }
+
+  return found > index ? data.substring(strIndex[0], strIndex[1]) : "";
+}
+
+String waitForClientData(int i) {
+  unsigned long previousMillis = millis();
+  unsigned long interval = 10000;
+
+  String buffer;
+  while (clients[i].connected()) {
+    if (clients[i].available()) {
+      Serial.println(clients[i].available());
+      buffer = clients[i].readStringUntil(END_TOKEN);
+      if (buffer.length() == 1 && buffer[0] == END_TOKEN)
+        buffer = "???\n"; // NOTE: Should never happen...
+      if (buffer.length() > 0)
+        break;
+    }
+    if (millis() - previousMillis >= interval)
+      break;
+    handleSystemEvents();
+  }
+  return buffer;
+}
+
+static boolean clients_runEvery(unsigned long interval) {
+  static unsigned long previousMillis = 0;
+  unsigned long currentMillis = millis();
+  if (currentMillis - previousMillis >= interval) {
+    previousMillis = currentMillis;
+    return true;
+  }
+  return false;
+}
+
+void periodic_report(unsigned long interval) {
+  unsigned long uptime = (millis() - startTime);
+  unsigned int report_shares = share_count - last_share_count;
+  float average_hashrate = calc_avg_hashrate();
+  Serial.println("Periodic mining report:");
+  Serial.println(" ‖ During the last " + String(interval / 1000.0, 1) +
+                 " seconds");
+  Serial.println(" ‖ You've mined " + String(report_shares) + " shares (" +
+                 String((float)report_shares / (interval / 1000.0), 2) +
+                 " shares/s)");
+  Serial.println(" ‖ Block(s) found: " + String(block_count));
+  Serial.println(" ‖ With the average hashrate of " +
+                 String(average_hashrate, 2) + " H/s  ");
+  Serial.println(" ‖ In this time period, you've solved " +
+                 String(average_hashrate * (interval / 1000), 0) + " hashes");
+  Serial.println(" ‖ Total miner uptime: " + timeString(uptime));
+
+  ws_sendAll("Periodic mining report:");
+  ws_sendAll(" ‖ During the last " + String(interval / 1000.0, 1) + " seconds");
+  ws_sendAll(" ‖ You've mined " + String(report_shares) + " shares (" +
+             String((float)report_shares / (interval / 1000.0), 2) +
+             " shares/s)");
+  ws_sendAll(" ‖ Block(s) found: " + String(block_count));
+  ws_sendAll(" ‖ With the average hashrate of " + String(average_hashrate, 2) +
+             " H/s  ");
+  ws_sendAll(" ‖ In this time period, you've solved " +
+             String(average_hashrate * (interval / 1000), 0) + " hashes");
+  ws_sendAll(" ‖ Total miner uptime: " + timeString(uptime));
+  last_share_count = share_count;
+}
+
+static float calc_avg_hashrate() {
+  float hashrate_sum = 0;
+  int client_count = 0;
+
+  for (int i = 0; i < CLIENTS; i++) {
+    if (clientsHashRate[i] > 0.0) {
+      client_count += 1;
+      hashrate_sum += clientsHashRate[i];
+    }
+  }
+  if (client_count == 0)
+    return 0;
+  else
+    return hashrate_sum / float(client_count);
+}
+
+// https://stackoverflow.com/questions/51731313/cross-platform-crc8-function-c-and-python-parity-check
+uint8_t crc8(uint8_t *addr, uint8_t len) {
+  uint8_t crc = 0;
+  for (uint8_t i = 0; i < len; i++) {
+    uint8_t inbyte = addr[i];
+    for (uint8_t j = 0; j < 8; j++) {
+      uint8_t mix = (crc ^ inbyte) & 0x01;
+      crc >>= 1;
+      if (mix)
+        crc ^= 0x8C;
+      inbyte >>= 1;
+    }
+  }
+  return crc;
+}
+
+static uint8_t calc_crc8(String msg) {
+  int msg_len = msg.length() + 1;
+  char char_array[msg_len];
+  msg.toCharArray(char_array, msg_len);
+  return crc8((uint8_t *)char_array, msg.length());
+}
+
+static boolean query_runEvery(unsigned long interval) {
+  static unsigned long previousMillis = 0;
+  unsigned long currentMillis = millis();
+  if (currentMillis - previousMillis >= interval) {
+    previousMillis = currentMillis;
+    return true;
+  }
+  return false;
+}
